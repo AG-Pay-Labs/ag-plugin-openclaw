@@ -1,0 +1,104 @@
+{
+  "id": "agpay",
+  "name": "AG Pay",
+  "description": "Request supervised purchase approval and record sandbox or external results through AG Pay.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true,
+    "onCommands": [
+      "agpay"
+    ]
+  },
+  "contracts": {
+    "tools": [
+      "agpay_request_purchase",
+      "agpay_get_purchase_request",
+      "agpay_record_purchase_result"
+    ]
+  },
+  "toolMetadata": {
+    "agpay_request_purchase": {
+      "optional": true
+    },
+    "agpay_record_purchase_result": {
+      "optional": true
+    }
+  },
+  "configContracts": {
+    "dangerousFlags": [
+      {
+        "path": "allowSandboxCompletion",
+        "equals": true
+      }
+    ],
+    "secretInputs": {
+      "paths": [
+        {
+          "path": "agentToken",
+          "expected": "string"
+        }
+      ]
+    }
+  },
+  "uiHints": {
+    "apiUrl": {
+      "label": "AG Pay API URL",
+      "placeholder": "https://api.example.com"
+    },
+    "agentToken": {
+      "label": "Agent access token",
+      "help": "Use an OpenClaw SecretRef. Plaintext is only suitable for controlled local development.",
+      "placeholder": "agt_...",
+      "sensitive": true
+    },
+    "heartbeatIntervalSeconds": {
+      "label": "Heartbeat interval",
+      "help": "Seconds between presence heartbeats."
+    },
+    "requestTimeoutMs": {
+      "label": "Request timeout",
+      "help": "Timeout in milliseconds for AG Pay API calls.",
+      "advanced": true
+    },
+    "allowSandboxCompletion": {
+      "label": "Allow sandbox result recording",
+      "help": "Records a confirmed external/sandbox result only; it never charges a payment method.",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiUrl": {
+        "type": "string",
+        "format": "uri",
+        "default": "http://127.0.0.1:8000",
+        "description": "Root URL of the AG Pay FastAPI service. HTTPS is required outside loopback."
+      },
+      "agentToken": {
+        "type": "string",
+        "minLength": 20,
+        "maxLength": 200,
+        "pattern": "^agt_[A-Za-z0-9_-]+$",
+        "description": "Materialized agent bearer credential. Configure it through a SecretRef."
+      },
+      "heartbeatIntervalSeconds": {
+        "type": "integer",
+        "minimum": 15,
+        "maximum": 110,
+        "default": 60
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 10000
+      },
+      "allowSandboxCompletion": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}
