@@ -8,6 +8,7 @@ describe("AG Pay plugin configuration", () => {
       apiUrl: "http://127.0.0.1:8000",
       heartbeatIntervalSeconds: 60,
       requestTimeoutMs: 10_000,
+      outcomePollIntervalSeconds: 15,
       allowSandboxCompletion: false,
     });
   });
@@ -21,6 +22,7 @@ describe("AG Pay plugin configuration", () => {
         agentToken: token,
         heartbeatIntervalSeconds: 30,
         requestTimeoutMs: 5_000,
+        outcomePollIntervalSeconds: 10,
         allowSandboxCompletion: true,
       }),
     ).toEqual({
@@ -28,6 +30,7 @@ describe("AG Pay plugin configuration", () => {
       agentToken: token,
       heartbeatIntervalSeconds: 30,
       requestTimeoutMs: 5_000,
+      outcomePollIntervalSeconds: 10,
       allowSandboxCompletion: true,
     });
   });
@@ -60,6 +63,8 @@ describe("AG Pay plugin configuration", () => {
     ["heartbeatIntervalSeconds", 111],
     ["requestTimeoutMs", 999],
     ["requestTimeoutMs", 60_001],
+    ["outcomePollIntervalSeconds", 4],
+    ["outcomePollIntervalSeconds", 301],
   ])("rejects an out-of-range %s", (key, value) => {
     expect(() => parsePluginConfig({ [key]: value })).toThrow();
   });

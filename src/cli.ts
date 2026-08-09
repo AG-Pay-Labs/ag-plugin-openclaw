@@ -299,7 +299,12 @@ export async function pairAgent(options: PairAgentOptions): Promise<{
       ...(options.softwareVersion === undefined
         ? {}
         : { software_version: options.softwareVersion }),
-      capabilities: ["cart-items.v1", "heartbeat.v1", "agpay.openclaw-plugin.v1"],
+      capabilities: [
+        "cart-items.v1",
+        "checkout-events.v1",
+        "heartbeat.v1",
+        "agpay.openclaw-plugin.v1",
+      ],
     });
     try {
       await reservation.commit(response.agent_access_token);

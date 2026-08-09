@@ -1,10 +1,11 @@
 {
   "name": "@agpay/openclaw-plugin",
   "version": "0.1.0",
-  "description": "OpenClaw tools for AG Pay supervised purchase approvals",
+  "description": "OpenClaw tools and sanitized outcome notifications for AG Pay supervised purchases",
   "type": "module",
   "license": "UNLICENSED",
   "files": [
+    "assets",
     "dist",
     "openclaw.plugin.json",
     "README.md"

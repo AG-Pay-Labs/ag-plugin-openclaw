@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import { AgPayApiError, AgPayClient, AgPayOutcomeUnknownError } from "../src/client.js";
 
-import { AGENT_ID, jsonResponse } from "./fixtures.js";
+import {
+  AGENT_ID,
+  cartItem,
+  checkoutEvent,
+  jsonResponse,
+  REQUEST_ID,
+} from "./fixtures.js";
 
 const AGENT_TOKEN = `agt_${"a".repeat(32)}`;
 
@@ -93,6 +99,61 @@ describe("AgPayClient transport safety", () => {
       agent_id: AGENT_ID,
       connection_state: "online",
     });
+  });
+
+  it("uses the direct agent-scoped purchase request endpoint", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(cartItem()));
+
+    await expect(clientWith(fetchMock).getPurchaseRequest(REQUEST_ID)).resolves.toMatchObject({
+      id: REQUEST_ID,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `https://agpay.example.test/api/v1/agent/cart-items/${REQUEST_ID}`,
+    );
+  });
+
+  it("reads a bounded ordered checkout event page after the persisted cursor", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({ events: [checkoutEvent({ cursor: 8 })], next_cursor: 8 }),
+    );
+
+    await expect(clientWith(fetchMock).listCheckoutEvents(7)).resolves.toMatchObject({
+      next_cursor: 8,
+      events: [{ request_id: REQUEST_ID, status: "succeeded" }],
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://agpay.example.test/api/v1/agent/checkout-events?after_cursor=7&limit=100",
+    );
+  });
+
+  it("rejects malformed or out-of-order checkout event pages", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({
+        events: [
+          checkoutEvent({ cursor: 2 }),
+          checkoutEvent({
+            cursor: 1,
+            event_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          }),
+        ],
+        next_cursor: 2,
+      }),
+    );
+
+    await expect(clientWith(fetchMock).listCheckoutEvents(0)).rejects.toThrow(/order/i);
+  });
+
+  it("rejects a claimed checkout success without a recorded purchase ID", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({
+        events: [checkoutEvent({ purchase_id: null })],
+        next_cursor: 1,
+      }),
+    );
+
+    await expect(clientWith(fetchMock).listCheckoutEvents(0)).rejects.toThrow(/purchase ID/i);
   });
 
   it("treats a malformed credential in a successful pairing response as unknown", async () => {

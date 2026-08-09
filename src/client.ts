@@ -5,6 +5,7 @@ import type {
   CartItemCreate,
   CartItemRead,
   CartItemStatus,
+  CheckoutEventPage,
   PurchaseComplete,
   PurchaseRead,
 } from "./types.js";
@@ -13,6 +14,7 @@ import {
   validateAgentTokenResponse,
   validateCartItem,
   validateCartItemList,
+  validateCheckoutEventPage,
   validateHeartbeatResponse,
   validatePurchase,
 } from "./validation.js";
@@ -34,6 +36,7 @@ interface RequestOptions {
   body?: unknown;
   authenticated?: boolean;
   outcomeSensitive?: boolean;
+  signal?: AbortSignal;
 }
 
 class AgPayResponseSizeError extends Error {
@@ -146,9 +149,10 @@ export class AgPayClient {
     return response;
   }
 
-  async heartbeat(): Promise<AgentHeartbeatResponse> {
+  async heartbeat(signal?: AbortSignal): Promise<AgentHeartbeatResponse> {
     const response = await this.#request(`${API_PREFIX}/agent/heartbeat`, {
       method: "POST",
+      ...(signal === undefined ? {} : { signal }),
     });
     validateHeartbeatResponse(response);
     return response;
@@ -176,12 +180,23 @@ export class AgPayClient {
   }
 
   async getPurchaseRequest(requestId: string): Promise<CartItemRead> {
-    const items = await this.listPurchaseRequests();
-    const item = items.find((candidate) => candidate.id === requestId);
-    if (!item) {
-      throw new AgPayApiError(404, "AG Pay purchase request was not found for this agent");
+    const response = await this.#request(
+      `${API_PREFIX}/agent/cart-items/${encodeURIComponent(requestId)}`,
+    );
+    validateCartItem(response);
+    return response;
+  }
+
+  async listCheckoutEvents(afterCursor: number, signal?: AbortSignal): Promise<CheckoutEventPage> {
+    if (!Number.isSafeInteger(afterCursor) || afterCursor < 0) {
+      throw new Error("Checkout event cursor must be a non-negative safe integer");
     }
-    return item;
+    const response = await this.#request(
+      `${API_PREFIX}/agent/checkout-events?after_cursor=${afterCursor}&limit=100`,
+      { ...(signal === undefined ? {} : { signal }) },
+    );
+    validateCheckoutEventPage(response);
+    return response;
   }
 
   async recordPurchaseResult(
@@ -214,6 +229,11 @@ export class AgPayClient {
       headers.set("Authorization", `Bearer ${this.#agentToken}`);
     }
 
+    const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, timeoutSignal])
+      : timeoutSignal;
+
     let response: Response;
     try {
       response = await this.#fetch(`${this.#apiUrl}${path}`, {
@@ -221,9 +241,12 @@ export class AgPayClient {
         headers,
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
         redirect: "error",
-        signal: AbortSignal.timeout(this.#timeoutMs),
+        signal,
       });
-    } catch {
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw error;
+      }
       if (options.outcomeSensitive) {
         throw new AgPayOutcomeUnknownError();
       }

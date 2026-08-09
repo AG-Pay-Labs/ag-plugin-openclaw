@@ -1,7 +1,7 @@
 {
   "id": "agpay",
   "name": "AG Pay",
-  "description": "Request supervised purchase approval and record sandbox or external results through AG Pay.",
+  "description": "Request supervised purchases and receive sanitized managed-checkout outcomes through AG Pay.",
   "version": "0.1.0",
   "activation": {
     "onStartup": true,
@@ -60,9 +60,14 @@
       "help": "Timeout in milliseconds for AG Pay API calls.",
       "advanced": true
     },
+    "outcomePollIntervalSeconds": {
+      "label": "Checkout outcome poll interval",
+      "help": "Seconds between agent-scoped sanitized checkout outcome polls.",
+      "advanced": true
+    },
     "allowSandboxCompletion": {
-      "label": "Allow sandbox result recording",
-      "help": "Records a confirmed external/sandbox result only; it never charges a payment method.",
+      "label": "Allow legacy sandbox result recording",
+      "help": "Test-only recording for requests without a platform-managed checkout; it never executes payment.",
       "advanced": true
     }
   },
@@ -77,11 +82,14 @@
         "description": "Root URL of the AG Pay FastAPI service. HTTPS is required outside loopback."
       },
       "agentToken": {
-        "type": "string",
+        "type": [
+          "string",
+          "object"
+        ],
         "minLength": 20,
         "maxLength": 200,
         "pattern": "^agt_[A-Za-z0-9_-]+$",
-        "description": "Materialized agent bearer credential. Configure it through a SecretRef."
+        "description": "Agent bearer credential. Configure it through an OpenClaw SecretRef."
       },
       "heartbeatIntervalSeconds": {
         "type": "integer",
@@ -94,6 +102,13 @@
         "minimum": 1000,
         "maximum": 60000,
         "default": 10000
+      },
+      "outcomePollIntervalSeconds": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 300,
+        "default": 15,
+        "description": "Seconds between sanitized managed-checkout outcome polls."
       },
       "allowSandboxCompletion": {
         "type": "boolean",

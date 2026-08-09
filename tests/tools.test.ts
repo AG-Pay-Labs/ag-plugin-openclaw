@@ -2,9 +2,23 @@ import { describe, expect, it, vi } from "vitest";
 
 import { AgPayClient } from "../src/client.js";
 import type { AgPayPluginConfig } from "../src/config.js";
-import { recordPurchaseResult, requestPurchase } from "../src/tools.js";
+import {
+  createRequestPurchaseTool,
+  getPurchaseRequest,
+  hasManagedCheckout,
+  type PurchaseRequestResult,
+  recordPurchaseResult,
+  requestPurchase,
+} from "../src/tools.js";
 
-import { cartItem, jsonRequestBody, jsonResponse, purchase, REQUEST_ID } from "./fixtures.js";
+import {
+  cartItem,
+  checkoutExecution,
+  jsonRequestBody,
+  jsonResponse,
+  purchase,
+  REQUEST_ID,
+} from "./fixtures.js";
 
 const AGENT_TOKEN = `agt_${"a".repeat(32)}`;
 
@@ -22,6 +36,7 @@ function config(allowSandboxCompletion: boolean): AgPayPluginConfig {
     agentToken: AGENT_TOKEN,
     heartbeatIntervalSeconds: 60,
     requestTimeoutMs: 10_000,
+    outcomePollIntervalSeconds: 15,
     allowSandboxCompletion,
   };
 }
@@ -46,6 +61,8 @@ describe("purchase tool safety", () => {
       billing_period: null,
       account_email: "agent@example.com",
       account_login_url: "https://merchant.example/login",
+      checkout_adapter: "demo",
+      checkout_url: "https://merchant.example/checkout/123",
     });
 
     expect(outboundBody).toMatchObject({
@@ -54,6 +71,10 @@ describe("purchase tool safety", () => {
         email: "agent@example.com",
         login_url: "https://merchant.example/login",
       },
+      checkout: {
+        adapter: "demo",
+        checkout_url: "https://merchant.example/checkout/123",
+      },
     });
     const outboundPassword = (outboundBody as { account: { password: unknown } }).account.password;
     expect(outboundPassword).toEqual(expect.any(String));
@@ -61,6 +82,44 @@ describe("purchase tool safety", () => {
     expect(JSON.stringify(result)).not.toContain(String(outboundPassword));
     expect(result).not.toHaveProperty("account");
     expect(result).not.toHaveProperty("credential_id");
+  });
+
+  it("requires the managed checkout adapter and URL as a pair before contacting AG Pay", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+
+    await expect(
+      requestPurchase(clientWith(fetchMock), {
+        title: "Annual reporting plan",
+        description: "Reporting software for the finance team",
+        product_url: "https://merchant.example/products/reporting",
+        reason: "Required for quarterly reporting",
+        unit_price: "12.50",
+        currency: "EUR",
+        account_email: "agent@example.com",
+        checkout_adapter: "demo",
+      }),
+    ).rejects.toThrow(/both checkout_adapter and checkout_url/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects recurring billing with managed checkout before contacting AG Pay", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+
+    await expect(
+      requestPurchase(clientWith(fetchMock), {
+        title: "Monthly reporting plan",
+        description: "Reporting software for the finance team",
+        product_url: "https://merchant.example/products/reporting",
+        reason: "Required for quarterly reporting",
+        unit_price: "12.50",
+        currency: "EUR",
+        billing_period: "monthly",
+        account_email: "agent@example.com",
+        checkout_adapter: "demo",
+        checkout_url: "https://merchant.example/checkout/123",
+      }),
+    ).rejects.toThrow(/managed checkout.*one-time|billing_period.*null/i);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("redacts a generated password even when the API echoes it in an error detail", async () => {
@@ -100,7 +159,7 @@ describe("purchase tool safety", () => {
   });
 
   it("does not record completion unless the server says the request is approved", async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse([cartItem()]));
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(cartItem()));
 
     await expect(
       recordPurchaseResult(clientWith(fetchMock), config(true), {
@@ -119,7 +178,7 @@ describe("purchase tool safety", () => {
     });
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse([approvedOneTimeRequest]))
+      .mockResolvedValueOnce(jsonResponse(approvedOneTimeRequest))
       .mockResolvedValueOnce(jsonResponse(purchase()));
 
     await expect(
@@ -142,7 +201,7 @@ describe("purchase tool safety", () => {
     let completionBody: unknown;
     const fetchMock = vi.fn<typeof fetch>().mockImplementation((_input, init) => {
       if ((init?.method ?? "GET") === "GET") {
-        return Promise.resolve(jsonResponse([approvedRequest]));
+        return Promise.resolve(jsonResponse(approvedRequest));
       }
       completionBody = jsonRequestBody(init);
       return Promise.resolve(jsonResponse(purchase({ amount: "31.47", currency: "GBP" })));
@@ -163,5 +222,140 @@ describe("purchase tool safety", () => {
       provider_reference: "merchant-reference-123",
       receipt_url: "https://merchant.example/receipts/123",
     });
+  });
+
+  it("refuses legacy completion when the platform owns a managed checkout", async () => {
+    const managedRequest = cartItem({
+      status: "approved",
+      approved_at: "2026-08-05T10:15:00.000Z",
+      checkout_adapter: "sandbox",
+      checkout_url: "https://merchant.example/checkout",
+      execution: checkoutExecution(),
+    });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(managedRequest));
+
+    await expect(
+      recordPurchaseResult(clientWith(fetchMock), config(true), {
+        request_id: REQUEST_ID,
+        provider_reference: "merchant-reference-123",
+      }),
+    ).rejects.toThrow(/platform-managed/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns only the safe execution summary and normalizes unknown error codes", async () => {
+    const rawError = "merchant_secret_stacktrace";
+    const managedRequest = cartItem({
+      status: "approved",
+      approved_at: "2026-08-05T10:15:00.000Z",
+      checkout_adapter: "sandbox",
+      checkout_url: "https://merchant.example/checkout",
+      execution: checkoutExecution({
+        status: "failed",
+        attempt_count: 1,
+        error_code: rawError,
+        error_message: "raw browser failure containing a card-adjacent secret",
+        submitted_at: "2026-08-05T10:16:00.000Z",
+        completed_at: "2026-08-05T10:17:00.000Z",
+      }),
+    });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(managedRequest));
+
+    const result = await getPurchaseRequest(clientWith(fetchMock), { request_id: REQUEST_ID });
+
+    expect(result).toMatchObject({
+      next_action: "review_checkout_failure_in_agpay",
+      human_review_required: false,
+      execution: { status: "failed", attempt_count: 1, error_code: "checkout_failed" },
+    });
+    expect(JSON.stringify(result)).not.toContain(rawError);
+    expect(JSON.stringify(result)).not.toMatch(/stacktrace|browser failure|checkout_origin/i);
+  });
+
+  it("tracks the originating request only after a definite successful creation", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse(
+        cartItem({
+          checkout_adapter: "demo",
+          checkout_url: "https://merchant.example/checkout/123",
+        }),
+      ),
+    );
+    const onRequestCreated = vi
+      .fn<(result: PurchaseRequestResult) => Promise<void>>()
+      .mockResolvedValue();
+    const tool = createRequestPurchaseTool(
+      () => ({ client: clientWith(fetchMock), config: config(false) }),
+      { onRequestCreated },
+    );
+
+    await tool.execute("tool-call", {
+      title: "Annual reporting plan",
+      description: "Reporting software for the finance team",
+      product_url: "https://merchant.example/products/reporting",
+      reason: "Required for quarterly reporting",
+      unit_price: "12.50",
+      currency: "EUR",
+      account_email: "agent@example.com",
+      checkout_adapter: "demo",
+      checkout_url: "https://merchant.example/checkout/123",
+    });
+
+    expect(onRequestCreated).toHaveBeenCalledOnce();
+    const tracked = onRequestCreated.mock.calls[0]?.[0];
+    expect(tracked?.request_id).toBe(REQUEST_ID);
+    if (!tracked) {
+      throw new Error("Expected a managed purchase tracking callback");
+    }
+    expect(hasManagedCheckout(tracked)).toBe(true);
+  });
+
+  it("does not register lifecycle tracking for a successful unmanaged request", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(cartItem()));
+    const onRequestCreated = vi
+      .fn<(result: PurchaseRequestResult) => Promise<void>>()
+      .mockResolvedValue();
+    const tool = createRequestPurchaseTool(
+      () => ({ client: clientWith(fetchMock), config: config(false) }),
+      { onRequestCreated },
+    );
+
+    await tool.execute("tool-call", {
+      title: "Annual reporting plan",
+      description: "Reporting software for the finance team",
+      product_url: "https://merchant.example/products/reporting",
+      reason: "Required for quarterly reporting",
+      unit_price: "12.50",
+      currency: "EUR",
+      account_email: "agent@example.com",
+    });
+
+    expect(onRequestCreated).not.toHaveBeenCalled();
+  });
+
+  it("does not track a request after an ambiguous creation outcome", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValueOnce(new Error("connection reset"));
+    const onRequestCreated = vi
+      .fn<(result: PurchaseRequestResult) => Promise<void>>()
+      .mockResolvedValue();
+    const tool = createRequestPurchaseTool(
+      () => ({ client: clientWith(fetchMock), config: config(false) }),
+      { onRequestCreated },
+    );
+
+    await expect(
+      tool.execute("tool-call", {
+        title: "Annual reporting plan",
+        description: "Reporting software for the finance team",
+        product_url: "https://merchant.example/products/reporting",
+        reason: "Required for quarterly reporting",
+        unit_price: "12.50",
+        currency: "EUR",
+        account_email: "agent@example.com",
+        checkout_adapter: "demo",
+        checkout_url: "https://merchant.example/checkout/123",
+      }),
+    ).rejects.toThrow(/outcome is unknown/i);
+    expect(onRequestCreated).not.toHaveBeenCalled();
   });
 });

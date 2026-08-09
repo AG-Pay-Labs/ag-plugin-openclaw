@@ -1,6 +1,7 @@
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_OUTCOME_POLL_INTERVAL_SECONDS = 15;
 
 export const pluginConfigJsonSchema = {
   type: "object",
@@ -13,11 +14,11 @@ export const pluginConfigJsonSchema = {
       description: "Root URL of the AG Pay FastAPI service. HTTPS is required outside loopback.",
     },
     agentToken: {
-      type: "string",
+      type: ["string", "object"],
       minLength: 20,
       maxLength: 200,
       pattern: "^agt_[A-Za-z0-9_-]+$",
-      description: "Materialized agent bearer credential. Configure it through a SecretRef.",
+      description: "Agent bearer credential. Configure it through an OpenClaw SecretRef.",
     },
     heartbeatIntervalSeconds: {
       type: "integer",
@@ -31,6 +32,13 @@ export const pluginConfigJsonSchema = {
       maximum: 60_000,
       default: DEFAULT_REQUEST_TIMEOUT_MS,
     },
+    outcomePollIntervalSeconds: {
+      type: "integer",
+      minimum: 5,
+      maximum: 300,
+      default: DEFAULT_OUTCOME_POLL_INTERVAL_SECONDS,
+      description: "Seconds between sanitized managed-checkout outcome polls.",
+    },
     allowSandboxCompletion: {
       type: "boolean",
       default: false,
@@ -43,6 +51,7 @@ export interface AgPayPluginConfig {
   agentToken?: string;
   heartbeatIntervalSeconds: number;
   requestTimeoutMs: number;
+  outcomePollIntervalSeconds: number;
   allowSandboxCompletion: boolean;
 }
 
@@ -135,6 +144,13 @@ export function parsePluginConfig(value: unknown): AgPayPluginConfig {
       1_000,
       60_000,
       "requestTimeoutMs",
+    ),
+    outcomePollIntervalSeconds: integerInRange(
+      raw.outcomePollIntervalSeconds,
+      DEFAULT_OUTCOME_POLL_INTERVAL_SECONDS,
+      5,
+      300,
+      "outcomePollIntervalSeconds",
     ),
     allowSandboxCompletion: raw.allowSandboxCompletion ?? false,
   };

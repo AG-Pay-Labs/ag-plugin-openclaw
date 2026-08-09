@@ -66,6 +66,8 @@ describe("AG Pay pairing credential storage", () => {
       pairing_token: PAIRING_TOKEN,
       instance_id: "test-openclaw-instance",
     });
+    const capabilities = (handshakeBody as { capabilities: unknown }).capabilities;
+    expect(capabilities).toEqual(expect.arrayContaining(["cart-items.v1", "checkout-events.v1"]));
     expect(await readFile(output, "utf8")).toBe(AGENT_TOKEN);
     if (process.platform !== "win32") {
       expect((await stat(output)).mode & 0o777).toBe(0o600);

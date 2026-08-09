@@ -1,5 +1,12 @@
 export type CartItemStatus = "proposed" | "approved" | "cancelled" | "purchased";
 export type BillingPeriod = "monthly" | "yearly";
+export type CheckoutExecutionStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "action_required"
+  | "outcome_unknown";
 
 export interface AgentHandshakeRequest {
   pairing_token: string;
@@ -36,6 +43,10 @@ export interface CartItemCreate {
     password: string;
     login_url?: string;
   };
+  checkout?: {
+    adapter: string;
+    checkout_url: string;
+  };
 }
 
 export interface CartItemRead {
@@ -57,9 +68,44 @@ export interface CartItemRead {
   decision_note: string | null;
   account_email: string;
   login_url: string | null;
+  checkout_adapter: string | null;
+  checkout_url: string | null;
+  execution: CheckoutExecutionRead | null;
   approved_at: string | null;
   cancelled_at: string | null;
   created_at: string;
+}
+
+export interface CheckoutExecutionRead {
+  id: string;
+  status: CheckoutExecutionStatus;
+  attempt_count: number;
+  approved_amount: string;
+  currency: string;
+  checkout_origin: string;
+  error_code: string | null;
+  error_message: string | null;
+  submitted_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CheckoutEventRead {
+  cursor: number;
+  event_id: string;
+  request_id: string;
+  status: CheckoutExecutionStatus;
+  purchase_id: string | null;
+  amount: string;
+  currency: string;
+  error_code: string | null;
+  occurred_at: string;
+}
+
+export interface CheckoutEventPage {
+  events: CheckoutEventRead[];
+  next_cursor: number;
 }
 
 export interface PurchaseComplete {

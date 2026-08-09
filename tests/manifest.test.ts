@@ -43,4 +43,20 @@ describe("OpenClaw package metadata", () => {
     expect(packageMetadata.openclaw.extensions).toContain("./src/index.ts");
     expect(packageMetadata.openclaw.runtimeExtensions).toContain("./dist/index.js");
   });
+
+  it("accepts a SecretRef-shaped agent token before OpenClaw materializes it", () => {
+    const safeParse = plugin.configSchema?.safeParse;
+    if (!safeParse) {
+      throw new Error("AG Pay plugin config schema is unavailable");
+    }
+    const result = safeParse({
+      agentToken: {
+        source: "file",
+        provider: "agpay",
+        id: "value",
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
 });

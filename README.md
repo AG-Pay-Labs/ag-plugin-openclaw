@@ -1,21 +1,30 @@
+<p align="center">
+  <img src="assets/agpay-mark.png" width="112" alt="AG Pay logo" />
+</p>
+
 # AG Pay for OpenClaw
 
 An installable OpenClaw plugin that connects one OpenClaw runtime to the AG Pay
 agent API. It lets the runtime request supervised purchase approval, inspect a
-request, and optionally record a confirmed sandbox or external result.
+request, and receive sanitized outcomes after the AG Pay platform handles a
+supported configured checkout.
 
-AG Pay is currently a control plane. This plugin does **not** charge a card,
-expose card credentials, or execute a live payment.
+This plugin never receives, injects, logs, or returns card or protected-browser
+credentials. Checkout execution belongs to the trusted AG Pay platform and is
+available only for adapters explicitly configured there.
 
 ## What the plugin adds
 
 - `agpay_request_purchase`: create a purchase request for the paired agent;
-- `agpay_get_purchase_request`: read the current state of one request;
-- `agpay_record_purchase_result`: record a confirmed sandbox/external result,
-  disabled by default and exposed as an optional OpenClaw tool;
+- `agpay_get_purchase_request`: read approval and sanitized checkout state;
+- `agpay_record_purchase_result`: legacy test-only recording for a request with
+  no platform-managed checkout, disabled by default;
 - `openclaw agpay pair`: exchange a one-time pairing token without placing it
   in an LLM prompt or shell argument;
-- a background heartbeat service that keeps the paired agent online.
+- a background heartbeat service that keeps the paired agent online;
+- a private outcome monitor that wakes the originating OpenClaw session with a
+  fixed, sanitized completion, failure, action-required, or unknown-outcome
+  message.
 
 The purchase-request tool generates a unique merchant password inside the
 trusted plugin runtime and submits it directly to AG Pay. The password is never
@@ -27,16 +36,30 @@ service. The AG Pay HTTP API remains the boundary behind the plugin. A separate
 MCP adapter can be added later for other agent runtimes without changing these
 tool contracts.
 
-## Current boundary
+## Checkout boundary
 
-The generated merchant password is currently only a planned credential stored
-by the AG Pay control plane. This plugin does not create the merchant account,
-navigate checkout, or inject that credential into a browser. A future trusted
-checkout executor should receive an opaque credential handle; the password
-must not be returned to the model or copied into a second plaintext store.
+After approval, the AG Pay platform may queue a checkout through a supported
+configured adapter. Managed checkout currently supports one-time purchases
+only; recurring requests with a non-null `billing_period` remain approval-only
+and cannot include managed-checkout parameters. Browser automation, Browserbase
+credentials and session IDs, merchant-account credentials, payment credentials,
+and provider secrets remain inside that trusted platform path. They are never
+sent to OpenClaw, its model, this plugin's state file, or plugin logs. The plugin stores only a
+nonsecret API/agent scope, an event cursor, and bounded
+purchase-request-to-session routing metadata so it can route sanitized
+outcomes. Scope changes reset the cursor and routes; cancelled, unmanaged, and
+30-day stale routes are pruned.
 
-An `approved` result therefore means that human approval is recorded and an
-external executor is required. It does not mean that checkout already happened.
+An undeliverable outcome keeps its own route and feed cursor pending for retry;
+direct reconciliation continues for other tracked requests. If durable prompt
+injection is unavailable, the plugin advances only after OpenClaw accepts a
+safe system-event fallback that directs the session to read the sanitized
+request status.
+
+An `approved` result means checkout is awaiting or entering AG Pay execution;
+it is not purchase confirmation. Only a `succeeded` execution event confirms a
+recorded purchase. `outcome_unknown` must be reconciled in AG Pay and must never
+be retried automatically.
 
 ## Requirements
 
@@ -63,6 +86,11 @@ make pack-check
 Before a release, install the ClawHub CLI and run `make clawhub-validate`.
 OpenClaw's `plugins build` and `plugins validate` authoring commands only apply
 to tool-only plugins; this package also registers a CLI and service.
+
+For an end-to-end local runtime, use the sibling
+[`ag-openclaw-playground`](https://github.com/AG-Pay-Labs/ag-openclaw-playground)
+repository. The complete base, platform, plugin, and playground clone/start
+sequence is in the [AG Pay quick start](https://github.com/AG-Pay-Labs/ag-pay#quick-start).
 
 ## Pair an agent
 
@@ -109,6 +137,7 @@ Configure the file as an OpenClaw SecretRef provider:
           agentToken: { source: "file", provider: "agpay", id: "value" },
           heartbeatIntervalSeconds: 60,
           requestTimeoutMs: 10000,
+          outcomePollIntervalSeconds: 15,
           allowSandboxCompletion: false,
         },
       },
@@ -125,21 +154,25 @@ openclaw secrets audit --check
 ```
 
 If the OpenClaw installation uses a restrictive tool policy, allow the `agpay`
-plugin or exact tool names. Both `agpay_request_purchase` and
-`agpay_record_purchase_result` are optional tools and must be explicitly
-allowlisted. Result recording also requires `allowSandboxCompletion: true`.
-`agpay_get_purchase_request` is read-only and registered by default.
-`allowSandboxCompletion` is a local plugin/tool-policy gate; it is not a scope
-encoded in or enforced by the `agt_...` bearer token.
+plugin or exact tool names. `agpay_request_purchase` is optional and must be
+explicitly allowlisted. `agpay_get_purchase_request` is read-only and registered
+by default. The legacy `agpay_record_purchase_result` tool is also optional,
+requires `allowSandboxCompletion: true`, and refuses any request that already
+has a platform-managed execution. The flag is a local legacy test gate; it is
+not a scope encoded in or enforced by the `agt_...` bearer token.
+
+Pairings created before checkout outcome support should be renewed so the
+runtime advertises the `checkout-events.v1` capability.
 
 SecretRefs and `0600` files reduce accidental disclosure and access by other OS
 users. They do not protect a bearer token from an agent with unrestricted shell
 or same-user filesystem access. Run OpenClaw with a tool/filesystem policy that
 does not expose its secret provider or token file to model-controlled code.
 
-Mutation requests are never retried automatically. If a proposal or result
-recording call loses its response, the plugin reports the outcome as unknown;
-inspect AG Pay state before any human-directed recovery action.
+Mutation requests are never retried automatically. If a proposal or legacy
+result-recording call loses its response, the plugin reports the outcome as
+unknown; inspect AG Pay state before any human-directed recovery action. Event
+polling uses cursor persistence and retries only the read operation.
 
 ## Install a local package build
 
@@ -159,10 +192,10 @@ Publishing to npm or ClawHub is intentionally a separate release action.
 | Pair | `POST /api/v1/agent/handshake` |
 | Heartbeat | `POST /api/v1/agent/heartbeat` |
 | Request purchase | `POST /api/v1/agent/cart-items` |
-| Get request | `GET /api/v1/agent/cart-items`, then owner-safe local selection |
-| Record result | `POST /api/v1/agent/cart-items/{id}/purchase` |
+| Get request | `GET /api/v1/agent/cart-items/{id}` |
+| Poll sanitized checkout events | `GET /api/v1/agent/checkout-events` |
+| Record legacy test result | `POST /api/v1/agent/cart-items/{id}/purchase` |
 
-The current backend does not have an agent-scoped single-item read endpoint, so
-the plugin lists only the authenticated agent's items and selects the requested
-UUID locally. When that endpoint is added, the client adapter can change without
-changing the model-facing tool contract.
+All reads are scoped by the paired agent credential. Outcome notifications use
+fixed plugin-owned wording and normalized reason codes; raw platform, merchant,
+browser, or provider errors are never injected into the model.
