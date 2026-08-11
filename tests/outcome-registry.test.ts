@@ -1,10 +1,10 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { OutcomeRegistry } from "../src/outcome-registry.js";
+import { enqueueOutcomeRoute, OutcomeRegistry } from "../src/outcome-registry.js";
 
 import { AGENT_ID, REQUEST_ID } from "./fixtures.js";
 
@@ -63,6 +63,66 @@ describe("OutcomeRegistry", () => {
     await restarted.advance(11, REQUEST_ID);
     const afterTerminal = new OutcomeRegistry(stateDir, SCOPE);
     await expect(afterTerminal.snapshot()).resolves.toEqual({ cursor: 11, requests: {} });
+  });
+
+  it("imports an atomic cross-process route into an already-initialized private registry", async () => {
+    const stateDir = await temporaryStateDir();
+    const runningRegistry = new OutcomeRegistry(stateDir, SCOPE);
+    await runningRegistry.initialize();
+    await runningRegistry.advance(7);
+
+    await enqueueOutcomeRoute(stateDir, SCOPE, REQUEST_ID, "agent:main:session:external", 2_000);
+
+    const inboxDirectory = join(stateDir, "agpay", "checkout-outcome-routes");
+    const [routeFile] = await readdir(inboxDirectory);
+    expect(routeFile).toMatch(/^checkout-route-.*\.json$/);
+    if (!routeFile) {
+      throw new Error("Expected a durable route handoff");
+    }
+    const routePath = join(inboxDirectory, routeFile);
+    const raw = await readFile(routePath, "utf8");
+    expect(JSON.parse(raw)).toEqual({
+      scope: { api_url: SCOPE.apiUrl, agent_id: AGENT_ID },
+      request_id: REQUEST_ID,
+      session_key: "agent:main:session:external",
+      tracked_at: 2_000,
+    });
+    if (process.platform !== "win32") {
+      expect((await stat(inboxDirectory)).mode & 0o777).toBe(0o700);
+      expect((await stat(routePath)).mode & 0o777).toBe(0o600);
+    }
+
+    await expect(runningRegistry.snapshot()).resolves.toEqual({
+      cursor: 7,
+      requests: {
+        [REQUEST_ID]: { sessionKey: "agent:main:session:external", trackedAt: 2_000 },
+      },
+    });
+    await expect(readdir(inboxDirectory)).resolves.toEqual([]);
+  });
+
+  it("does not lose an external route while the monitor advances its cursor", async () => {
+    const stateDir = await temporaryStateDir();
+    const runningRegistry = new OutcomeRegistry(stateDir, SCOPE);
+    await runningRegistry.initialize();
+
+    await Promise.all([
+      runningRegistry.advance(23),
+      enqueueOutcomeRoute(
+        stateDir,
+        SCOPE,
+        REQUEST_ID,
+        "agent:main:session:concurrent",
+        3_000,
+      ),
+    ]);
+
+    await expect(runningRegistry.snapshot()).resolves.toEqual({
+      cursor: 23,
+      requests: {
+        [REQUEST_ID]: { sessionKey: "agent:main:session:concurrent", trackedAt: 3_000 },
+      },
+    });
   });
 
   it("forgets every tracked request owned by a reset session", async () => {

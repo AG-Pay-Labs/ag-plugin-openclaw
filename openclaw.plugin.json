@@ -65,6 +65,22 @@
       "help": "Seconds between agent-scoped sanitized checkout outcome polls.",
       "advanced": true
     },
+    "outcomeDeliveryTarget": {
+      "label": "Checkout outcome delivery",
+      "help": "Use last to notify the originating session's last external channel, or none for internal-only consumption.",
+      "advanced": true
+    },
+    "defaultCheckoutAdapter": {
+      "label": "Default checkout adapter",
+      "help": "Optional platform adapter for one-time requests that omit checkout fields. Configure it with the default checkout URL.",
+      "advanced": true
+    },
+    "defaultCheckoutUrl": {
+      "label": "Default checkout URL",
+      "help": "Optional non-secret HTTPS checkout entry URL paired with the default adapter.",
+      "placeholder": "https://checkout.example.com/",
+      "advanced": true
+    },
     "allowSandboxCompletion": {
       "label": "Allow legacy sandbox result recording",
       "help": "Test-only recording for requests without a platform-managed checkout; it never executes payment.",
@@ -110,10 +126,39 @@
         "default": 15,
         "description": "Seconds between sanitized managed-checkout outcome polls."
       },
+      "outcomeDeliveryTarget": {
+        "type": "string",
+        "enum": [
+          "last",
+          "none"
+        ],
+        "default": "last",
+        "description": "Deliver a sanitized checkout outcome to the originating session's last external channel, or consume it internally without external delivery."
+      },
+      "defaultCheckoutAdapter": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+        "description": "Optional platform adapter injected when a one-time purchase request omits managed-checkout fields. Configure it with defaultCheckoutUrl."
+      },
+      "defaultCheckoutUrl": {
+        "type": "string",
+        "format": "uri",
+        "pattern": "^https://[^/?#@\\s]+(?:/[^?#\\s]*)?$",
+        "maxLength": 2048,
+        "description": "Optional HTTPS checkout entry URL injected with defaultCheckoutAdapter. It must not contain credentials, a query string, or a fragment."
+      },
       "allowSandboxCompletion": {
         "type": "boolean",
         "default": false
       }
+    },
+    "dependentRequired": {
+      "defaultCheckoutAdapter": [
+        "defaultCheckoutUrl"
+      ],
+      "defaultCheckoutUrl": [
+        "defaultCheckoutAdapter"
+      ]
     }
   }
 }

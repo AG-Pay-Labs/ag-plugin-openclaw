@@ -30,13 +30,21 @@ function clientWith(fetchImplementation: typeof fetch): AgPayClient {
   });
 }
 
-function config(allowSandboxCompletion: boolean): AgPayPluginConfig {
+function config(
+  allowSandboxCompletion: boolean,
+  checkoutDefaults: Pick<
+    AgPayPluginConfig,
+    "defaultCheckoutAdapter" | "defaultCheckoutUrl"
+  > = {},
+): AgPayPluginConfig {
   return {
     apiUrl: "https://agpay.example.test",
     agentToken: AGENT_TOKEN,
     heartbeatIntervalSeconds: 60,
     requestTimeoutMs: 10_000,
     outcomePollIntervalSeconds: 15,
+    outcomeDeliveryTarget: "last",
+    ...checkoutDefaults,
     allowSandboxCompletion,
   };
 }
@@ -100,6 +108,142 @@ describe("purchase tool safety", () => {
       }),
     ).rejects.toThrow(/both checkout_adapter and checkout_url/i);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("injects a configured checkout pair when product facts omit explicit checkout fields", async () => {
+    let outboundBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementationOnce((_input, init) => {
+      outboundBody = jsonRequestBody(init);
+      return Promise.resolve(
+        jsonResponse(
+          cartItem({
+            checkout_adapter: "stripe-hosted",
+            checkout_url: "https://checkout.stripe.com/",
+          }),
+        ),
+      );
+    });
+    const onRequestCreated = vi
+      .fn<(result: PurchaseRequestResult) => Promise<void>>()
+      .mockResolvedValue();
+    const tool = createRequestPurchaseTool(
+      () => ({
+        client: clientWith(fetchMock),
+        config: config(false, {
+          defaultCheckoutAdapter: "stripe-hosted",
+          defaultCheckoutUrl: "https://checkout.stripe.com/",
+        }),
+      }),
+      { onRequestCreated },
+    );
+
+    await tool.execute("tool-call", {
+      title: "Desk lamp",
+      description: "Adjustable LED desk lamp",
+      product_url: "https://merchant.example/products/desk-lamp",
+      merchant: "Example Merchant",
+      reason: "Needed for the office",
+      quantity: 1,
+      unit_price: "39.00",
+      currency: "EUR",
+      account_email: "agent@example.com",
+    });
+
+    expect(outboundBody).toMatchObject({
+      product_url: "https://merchant.example/products/desk-lamp",
+      checkout: {
+        adapter: "stripe-hosted",
+        checkout_url: "https://checkout.stripe.com/",
+      },
+    });
+    expect(onRequestCreated).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an explicit checkout pair authoritative over configured defaults", async () => {
+    let outboundBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementationOnce((_input, init) => {
+      outboundBody = jsonRequestBody(init);
+      return Promise.resolve(jsonResponse(cartItem()));
+    });
+
+    await requestPurchase(
+      clientWith(fetchMock),
+      {
+        title: "Desk lamp",
+        description: "Adjustable LED desk lamp",
+        product_url: "https://merchant.example/products/desk-lamp",
+        reason: "Needed for the office",
+        unit_price: "39.00",
+        currency: "EUR",
+        account_email: "agent@example.com",
+        checkout_adapter: "merchant-specific",
+        checkout_url: "https://merchant.example/checkout",
+      },
+      {
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/",
+      },
+    );
+
+    expect(outboundBody).toMatchObject({
+      checkout: {
+        adapter: "merchant-specific",
+        checkout_url: "https://merchant.example/checkout",
+      },
+    });
+  });
+
+  it("does not complete a partial explicit pair from configured defaults", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+
+    await expect(
+      requestPurchase(
+        clientWith(fetchMock),
+        {
+          title: "Desk lamp",
+          description: "Adjustable LED desk lamp",
+          product_url: "https://merchant.example/products/desk-lamp",
+          reason: "Needed for the office",
+          unit_price: "39.00",
+          currency: "EUR",
+          account_email: "agent@example.com",
+          checkout_adapter: "merchant-specific",
+        },
+        {
+          defaultCheckoutAdapter: "stripe-hosted",
+          defaultCheckoutUrl: "https://checkout.stripe.com/",
+        },
+      ),
+    ).rejects.toThrow(/both checkout_adapter and checkout_url/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps recurring requests approval-only instead of injecting a one-time default", async () => {
+    let outboundBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementationOnce((_input, init) => {
+      outboundBody = jsonRequestBody(init);
+      return Promise.resolve(jsonResponse(cartItem({ billing_period: "monthly" })));
+    });
+
+    await requestPurchase(
+      clientWith(fetchMock),
+      {
+        title: "Monthly reporting plan",
+        description: "Reporting software for the finance team",
+        product_url: "https://merchant.example/products/reporting",
+        reason: "Required for quarterly reporting",
+        unit_price: "12.50",
+        currency: "EUR",
+        billing_period: "monthly",
+        account_email: "agent@example.com",
+      },
+      {
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/",
+      },
+    );
+
+    expect(outboundBody).not.toHaveProperty("checkout");
   });
 
   it("rejects recurring billing with managed checkout before contacting AG Pay", async () => {

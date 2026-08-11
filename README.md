@@ -24,7 +24,8 @@ available only for adapters explicitly configured there.
 - a background heartbeat service that keeps the paired agent online;
 - a private outcome monitor that wakes the originating OpenClaw session with a
   fixed, sanitized completion, failure, action-required, or unknown-outcome
-  message.
+  message and, by default, requests delivery of that session's reply to its
+  last external user channel.
 
 The purchase-request tool generates a unique merchant password inside the
 trusted plugin runtime and submits it directly to AG Pay. The password is never
@@ -44,11 +45,14 @@ only; recurring requests with a non-null `billing_period` remain approval-only
 and cannot include managed-checkout parameters. Browser automation, Browserbase
 credentials and session IDs, merchant-account credentials, payment credentials,
 and provider secrets remain inside that trusted platform path. They are never
-sent to OpenClaw, its model, this plugin's state file, or plugin logs. The plugin stores only a
-nonsecret API/agent scope, an event cursor, and bounded
+sent to OpenClaw, its model, this plugin's state file, or plugin logs. The plugin
+stores only a nonsecret API/agent scope, an event cursor, and bounded
 purchase-request-to-session routing metadata so it can route sanitized
-outcomes. Scope changes reset the cursor and routes; cancelled, unmanaged, and
-30-day stale routes are pruned.
+outcomes. Because an OpenClaw tool and service may execute in separate
+processes, the tool publishes each route as an atomic private state message;
+the monitor folds those messages into its cursor registry without either
+process overwriting the other's state. Scope changes reset the cursor and
+routes; cancelled, unmanaged, and 30-day stale routes are pruned.
 
 An undeliverable outcome keeps its own route and feed cursor pending for retry;
 direct reconciliation continues for other tracked requests. If durable prompt
@@ -56,10 +60,32 @@ injection is unavailable, the plugin advances only after OpenClaw accepts a
 safe system-event fallback that directs the session to read the sanitized
 request status.
 
+Each accepted terminal outcome requests an immediate heartbeat for the exact
+session that created the purchase request. The wake is hook-scoped so OpenClaw
+inspects that session's queued outcome even when `HEARTBEAT.md` is empty.
+`outcomeDeliveryTarget: "last"` is
+the default and asks OpenClaw to deliver that turn's reply to the last external
+channel recorded for that same session; it does not select another session or
+an arbitrary recipient. Set it to `"none"` to let the originating session
+consume the outcome without an external message. If no last route is available
+or channel policy blocks delivery, the scoped turn can still consume the
+outcome but OpenClaw will not send an external message. If the immediate wake
+cannot be requested, the durable injection remains queued for that session's
+next turn.
+
 An `approved` result means checkout is awaiting or entering AG Pay execution;
 it is not purchase confirmation. Only a `succeeded` execution event confirms a
 recorded purchase. `outcome_unknown` must be reconciled in AG Pay and must never
 be retried automatically.
+
+Operators may configure `defaultCheckoutAdapter` and `defaultCheckoutUrl` as a
+pair. For a one-time request that omits both model-facing checkout fields, the
+plugin injects that non-secret pair directly into the AG Pay API request. This
+lets OpenClaw submit a product URL and verified product facts without having to
+know the platform's checkout bootstrap URL. An explicit `checkout_adapter` plus
+`checkout_url` pair remains authoritative; a partial explicit pair is rejected
+rather than combined with a default. When the default pair is absent, omitted
+checkout fields preserve the legacy approval-only behavior.
 
 ## Requirements
 
@@ -138,6 +164,9 @@ Configure the file as an OpenClaw SecretRef provider:
           heartbeatIntervalSeconds: 60,
           requestTimeoutMs: 10000,
           outcomePollIntervalSeconds: 15,
+          outcomeDeliveryTarget: "last",
+          defaultCheckoutAdapter: "stripe-hosted",
+          defaultCheckoutUrl: "https://checkout.stripe.com/",
           allowSandboxCompletion: false,
         },
       },
@@ -163,6 +192,12 @@ not a scope encoded in or enforced by the `agt_...` bearer token.
 
 Pairings created before checkout outcome support should be renewed so the
 runtime advertises the `checkout-events.v1` capability.
+
+The example default pair is suitable only when the platform operator has
+enabled a matching `stripe-hosted` adapter. Both values are optional, but they
+must be configured together, and the URL must use HTTPS without embedded
+credentials, a query string, or a fragment. Removing both values restores
+approval-only behavior for requests that omit checkout fields.
 
 SecretRefs and `0600` files reduce accidental disclosure and access by other OS
 users. They do not protect a bearer token from an agent with unrestricted shell

@@ -4,11 +4,13 @@ import {
   type OpenClawPluginDefinition,
   type OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 
 import { AgPayClient } from "./client.js";
 import { registerAgPayCli } from "./cli.js";
 import { parsePluginConfig, pluginConfigJsonSchema, requireAgentToken } from "./config.js";
 import { HeartbeatService } from "./heartbeat.js";
+import { persistCreatedRequestRoute } from "./outcome-routing.js";
 import { CheckoutOutcomeService } from "./outcome-service.js";
 import {
   createGetPurchaseRequestTool,
@@ -49,22 +51,18 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
             if (!ctx.sessionKey || !hasManagedCheckout(result)) {
               return;
             }
-            const service = outcomeService;
-            if (!service) {
-              api.logger.warn(
-                "AG Pay created a purchase request before outcome tracking became available",
-              );
-              return;
-            }
             try {
-              if (!(await service.track(result.request_id, ctx.sessionKey))) {
-                api.logger.warn(
-                  "AG Pay created a purchase request before outcome tracking became available",
-                );
-              }
+              const { client, config } = getClient();
+              await persistCreatedRequestRoute({
+                client,
+                stateDir: resolveStateDir(),
+                apiUrl: config.apiUrl,
+                requestId: result.request_id,
+                sessionKey: ctx.sessionKey,
+              });
             } catch {
               api.logger.warn(
-                "AG Pay could not persist or immediately reconcile purchase outcome session routing",
+                "AG Pay could not persist purchase outcome session routing",
               );
             }
           },
@@ -108,6 +106,7 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
             stateDir: ctx.stateDir,
             apiUrl: config.apiUrl,
             pollIntervalSeconds: config.outcomePollIntervalSeconds,
+            outcomeDeliveryTarget: config.outcomeDeliveryTarget,
             logger: api.logger,
             notifications: {
               enqueueNextTurnInjection: (input) =>

@@ -9,6 +9,7 @@ describe("AG Pay plugin configuration", () => {
       heartbeatIntervalSeconds: 60,
       requestTimeoutMs: 10_000,
       outcomePollIntervalSeconds: 15,
+      outcomeDeliveryTarget: "last",
       allowSandboxCompletion: false,
     });
   });
@@ -23,6 +24,7 @@ describe("AG Pay plugin configuration", () => {
         heartbeatIntervalSeconds: 30,
         requestTimeoutMs: 5_000,
         outcomePollIntervalSeconds: 10,
+        outcomeDeliveryTarget: "none",
         allowSandboxCompletion: true,
       }),
     ).toEqual({
@@ -31,8 +33,56 @@ describe("AG Pay plugin configuration", () => {
       heartbeatIntervalSeconds: 30,
       requestTimeoutMs: 5_000,
       outcomePollIntervalSeconds: 10,
+      outcomeDeliveryTarget: "none",
       allowSandboxCompletion: true,
     });
+  });
+
+  it("accepts a paired managed-checkout default", () => {
+    expect(
+      parsePluginConfig({
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com",
+      }),
+    ).toMatchObject({
+      defaultCheckoutAdapter: "stripe-hosted",
+      defaultCheckoutUrl: "https://checkout.stripe.com/",
+    });
+  });
+
+  it.each([
+    [{ defaultCheckoutAdapter: "stripe-hosted" }, /configured together/i],
+    [{ defaultCheckoutUrl: "https://checkout.stripe.com/" }, /configured together/i],
+    [
+      {
+        defaultCheckoutAdapter: "Stripe Hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/",
+      },
+      /defaultCheckoutAdapter/i,
+    ],
+    [
+      {
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "http://checkout.stripe.com/",
+      },
+      /must use HTTPS/i,
+    ],
+    [
+      {
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://user:password@checkout.stripe.com/",
+      },
+      /must not contain credentials/i,
+    ],
+    [
+      {
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/?session=secret",
+      },
+      /query string or fragment/i,
+    ],
+  ])("rejects an unsafe or incomplete managed-checkout default (%j)", (value, message) => {
+    expect(() => parsePluginConfig(value)).toThrow(message);
   });
 
   it.each([
@@ -67,5 +117,11 @@ describe("AG Pay plugin configuration", () => {
     ["outcomePollIntervalSeconds", 301],
   ])("rejects an out-of-range %s", (key, value) => {
     expect(() => parsePluginConfig({ [key]: value })).toThrow();
+  });
+
+  it("rejects an unsupported checkout outcome delivery target", () => {
+    expect(() => parsePluginConfig({ outcomeDeliveryTarget: "telegram" })).toThrow(
+      /outcomeDeliveryTarget/i,
+    );
   });
 });

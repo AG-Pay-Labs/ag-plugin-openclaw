@@ -1,5 +1,6 @@
 import { AgPayApiError, type AgPayClient } from "./client.js";
 import { formatSafeCheckoutOutcome, isTerminalCheckoutStatus } from "./checkout-safety.js";
+import type { OutcomeDeliveryTarget } from "./config.js";
 import type { OutcomeRegistry } from "./outcome-registry.js";
 import type { CartItemRead, CheckoutEventRead } from "./types.js";
 
@@ -31,10 +32,11 @@ export interface OutcomeNotificationRuntime {
     options: { sessionKey: string; contextKey: string },
   ): boolean;
   requestHeartbeat(options: {
-    source: "other";
-    intent: "event";
+    source: "hook";
+    intent: "immediate";
     reason: "agpay-purchase-outcome";
     sessionKey: string;
+    heartbeat: { target: OutcomeDeliveryTarget };
   }): void;
 }
 
@@ -44,6 +46,7 @@ interface OutcomeMonitorOptions {
   pollIntervalSeconds: number;
   logger: OutcomeMonitorLogger;
   notifications: OutcomeNotificationRuntime;
+  outcomeDeliveryTarget?: OutcomeDeliveryTarget;
 }
 
 export class OutcomeMonitor {
@@ -52,6 +55,7 @@ export class OutcomeMonitor {
   readonly #pollIntervalMs: number;
   readonly #logger: OutcomeMonitorLogger;
   readonly #notifications: OutcomeNotificationRuntime;
+  readonly #outcomeDeliveryTarget: OutcomeDeliveryTarget;
   readonly #seenEventIds = new Set<string>();
   #abortController: AbortController | undefined;
   #running: Promise<void> | undefined;
@@ -64,6 +68,7 @@ export class OutcomeMonitor {
     this.#pollIntervalMs = options.pollIntervalSeconds * 1_000;
     this.#logger = options.logger;
     this.#notifications = options.notifications;
+    this.#outcomeDeliveryTarget = options.outcomeDeliveryTarget ?? "last";
   }
 
   start(): void {
@@ -208,11 +213,12 @@ export class OutcomeMonitor {
       return;
     }
 
-    const message = formatSafeCheckoutOutcome(event);
-    if (!message) {
+    const safeOutcome = formatSafeCheckoutOutcome(event);
+    if (!safeOutcome) {
       await this.#registry.advance(event.cursor);
       return;
     }
+    const message = `${safeOutcome} Report this checkout outcome to the user now.`;
     const idempotencyKey = `agpay-checkout-event-${event.event_id}`;
     let durableInjectionQueued = false;
     try {
@@ -238,7 +244,7 @@ export class OutcomeMonitor {
     let systemEventQueued = false;
     try {
       systemEventQueued = this.#notifications.enqueueSystemEvent(
-        `AG Pay has a checkout outcome for purchase request ${event.request_id}. Use agpay_get_purchase_request to read its sanitized status.`,
+        `AG Pay has a checkout outcome for purchase request ${event.request_id}. Use agpay_get_purchase_request to read its sanitized status, then report that outcome to the user.`,
         { sessionKey, contextKey: idempotencyKey },
       );
     } catch {
@@ -249,10 +255,11 @@ export class OutcomeMonitor {
     }
     try {
       this.#notifications.requestHeartbeat({
-        source: "other",
-        intent: "event",
+        source: "hook",
+        intent: "immediate",
         reason: "agpay-purchase-outcome",
         sessionKey,
+        heartbeat: { target: this.#outcomeDeliveryTarget },
       });
     } catch {
       this.#logger.warn(

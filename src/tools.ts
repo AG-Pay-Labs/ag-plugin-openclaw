@@ -82,6 +82,11 @@ export interface PurchaseRequestResult {
 
 export type ClientFactory = () => { client: AgPayClient; config: AgPayPluginConfig };
 
+type ManagedCheckoutDefaults = Pick<
+  AgPayPluginConfig,
+  "defaultCheckoutAdapter" | "defaultCheckoutUrl"
+>;
+
 export function hasManagedCheckout(result: PurchaseRequestResult): boolean {
   return result.checkout_adapter !== null && result.checkout_url !== null;
 }
@@ -147,16 +152,41 @@ export function safePurchaseRequest(item: CartItemRead): PurchaseRequestResult {
 export async function requestPurchase(
   client: AgPayClient,
   parameters: RequestPurchaseParameters,
+  defaults: ManagedCheckoutDefaults = {},
 ): Promise<PurchaseRequestResult> {
-  const hasAnyCheckoutParameter =
+  const hasAnyExplicitCheckoutParameter =
     parameters.checkout_adapter !== undefined || parameters.checkout_url !== undefined;
-  if (hasAnyCheckoutParameter && parameters.billing_period != null) {
+  if ((parameters.checkout_adapter === undefined) !== (parameters.checkout_url === undefined)) {
+    throw new Error("Managed checkout requires both checkout_adapter and checkout_url");
+  }
+  if (
+    (defaults.defaultCheckoutAdapter === undefined) !==
+    (defaults.defaultCheckoutUrl === undefined)
+  ) {
+    throw new Error(
+      "AG Pay defaultCheckoutAdapter and defaultCheckoutUrl must be configured together",
+    );
+  }
+  const useConfiguredDefaults =
+    !hasAnyExplicitCheckoutParameter && parameters.billing_period == null;
+  const checkoutAdapter = hasAnyExplicitCheckoutParameter
+    ? parameters.checkout_adapter
+    : useConfiguredDefaults
+      ? defaults.defaultCheckoutAdapter
+      : undefined;
+  const checkoutUrl = hasAnyExplicitCheckoutParameter
+    ? parameters.checkout_url
+    : useConfiguredDefaults
+      ? defaults.defaultCheckoutUrl
+      : undefined;
+  if (
+    checkoutAdapter !== undefined &&
+    checkoutUrl !== undefined &&
+    parameters.billing_period != null
+  ) {
     throw new Error(
       "AG Pay managed checkout supports one-time purchases only; billing_period must be null or omitted",
     );
-  }
-  if ((parameters.checkout_adapter === undefined) !== (parameters.checkout_url === undefined)) {
-    throw new Error("Managed checkout requires both checkout_adapter and checkout_url");
   }
   const generatedMerchantPassword = randomBytes(24).toString("base64url");
   const item = await client.requestPurchase({
@@ -176,12 +206,12 @@ export async function requestPurchase(
         ? {}
         : { login_url: parameters.account_login_url }),
     },
-    ...(parameters.checkout_adapter === undefined || parameters.checkout_url === undefined
+    ...(checkoutAdapter === undefined || checkoutUrl === undefined
       ? {}
       : {
           checkout: {
-            adapter: parameters.checkout_adapter,
-            checkout_url: parameters.checkout_url,
+            adapter: checkoutAdapter,
+            checkout_url: checkoutUrl,
           },
         }),
   });
@@ -313,7 +343,7 @@ export function createRequestPurchaseTool(
     name: "agpay_request_purchase",
     label: "Request purchase approval",
     description:
-      "Create a supervised AG Pay purchase request. Managed checkout currently supports one-time purchases only: provide both checkout_adapter and checkout_url and omit billing_period (or set it to null). Use only an adapter known to be configured by the AG Pay operator; the server validates the checkout origin. After human approval, AG Pay may execute checkout without exposing payment credentials to the model. Use only after product, merchant, quantity, and exact price are known.",
+      "Create a supervised AG Pay purchase request. Managed checkout currently supports one-time purchases only: omit billing_period (or set it to null). When the operator configured a default managed-checkout rail, product_url and the product facts are sufficient; otherwise provide both checkout_adapter and checkout_url. Explicit checkout fields override the configured default and must still be supplied as a pair. Use only an adapter known to be configured by the AG Pay operator; the server validates the checkout origin. After human approval, AG Pay may execute checkout without exposing payment credentials to the model. Use only after product, merchant, quantity, and exact price are known.",
     parameters: Type.Object(
       {
         title: Type.String({ minLength: 1, maxLength: 255, ...NonWhitespaceSchema }),
@@ -338,8 +368,8 @@ export function createRequestPurchaseTool(
     ),
     outputSchema: PurchaseRequestOutputSchema,
     async execute(_toolCallId: string, parameters: RequestPurchaseParameters) {
-      const { client } = getClient();
-      const result = await requestPurchase(client, parameters);
+      const { client, config } = getClient();
+      const result = await requestPurchase(client, parameters, config);
       if (hasManagedCheckout(result)) {
         await options.onRequestCreated?.(result);
       }

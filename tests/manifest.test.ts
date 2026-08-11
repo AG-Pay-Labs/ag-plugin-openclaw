@@ -59,4 +59,32 @@ describe("OpenClaw package metadata", () => {
 
     expect(result.success).toBe(true);
   });
+
+  it("requires the managed-checkout default fields as a schema-level pair", () => {
+    const safeParse = plugin.configSchema?.safeParse;
+    if (!safeParse) {
+      throw new Error("AG Pay plugin config schema is unavailable");
+    }
+
+    expect(
+      safeParse({
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/",
+      }).success,
+    ).toBe(true);
+    expect(safeParse({ defaultCheckoutAdapter: "stripe-hosted" }).success).toBe(false);
+    expect(safeParse({ defaultCheckoutUrl: "https://checkout.stripe.com/" }).success).toBe(false);
+    expect(
+      safeParse({
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://user:password@checkout.stripe.com/",
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParse({
+        defaultCheckoutAdapter: "stripe-hosted",
+        defaultCheckoutUrl: "https://checkout.stripe.com/?session=secret",
+      }).success,
+    ).toBe(false);
+  });
 });

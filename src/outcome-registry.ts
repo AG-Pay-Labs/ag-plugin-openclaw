@@ -1,14 +1,29 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_STATE_BYTES = 1_048_576;
+const MAX_INBOX_ROUTE_BYTES = 8_192;
 const MAX_TRACKED_REQUESTS = 1_000;
 const MAX_SESSION_KEY_LENGTH = 1_024;
 const MAX_API_URL_LENGTH = 2_048;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const INBOX_DIRECTORY_NAME = "checkout-outcome-routes";
+const INBOX_FILE_PATTERN = new RegExp(
+  `^checkout-route-(${UUID_PATTERN.source.slice(1, -1)})-(${UUID_PATTERN.source.slice(1, -1)})\\.json$`,
+  "i",
+);
 
 interface StoredOutcomeScope {
   api_url: string;
@@ -28,6 +43,11 @@ export interface OutcomeRoute {
 interface StoredOutcomeRoute {
   session_key: string;
   tracked_at: number;
+}
+
+interface StoredInboxRoute extends StoredOutcomeRoute {
+  scope: StoredOutcomeScope;
+  request_id: string;
 }
 
 interface OutcomeRegistryState {
@@ -91,6 +111,62 @@ function scopesEqual(left: StoredOutcomeScope, right: StoredOutcomeScope): boole
   return left.api_url === right.api_url && left.agent_id === right.agent_id;
 }
 
+function validateRouteValues(requestId: string, sessionKey: string, trackedAt: number): void {
+  if (!UUID_PATTERN.test(requestId)) {
+    throw new Error("AG Pay purchase request ID is invalid");
+  }
+  if (sessionKey.length < 1 || sessionKey.length > MAX_SESSION_KEY_LENGTH) {
+    throw new Error("OpenClaw session key is invalid");
+  }
+  if (!Number.isSafeInteger(trackedAt) || trackedAt < 0) {
+    throw new Error("AG Pay outcome tracking timestamp is invalid");
+  }
+}
+
+function storedInboxRoute(value: unknown, scope: StoredOutcomeScope): StoredInboxRoute | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const data = value as Record<string, unknown>;
+  const routeScope = storedScope(data.scope);
+  if (
+    !routeScope ||
+    !scopesEqual(routeScope, scope) ||
+    typeof data.request_id !== "string" ||
+    !UUID_PATTERN.test(data.request_id) ||
+    typeof data.session_key !== "string" ||
+    data.session_key.length < 1 ||
+    data.session_key.length > MAX_SESSION_KEY_LENGTH ||
+    !Number.isSafeInteger(data.tracked_at) ||
+    (data.tracked_at as number) < 0
+  ) {
+    return null;
+  }
+  return {
+    scope: routeScope,
+    request_id: data.request_id.toLowerCase(),
+    session_key: data.session_key,
+    tracked_at: data.tracked_at as number,
+  };
+}
+
+async function ensurePrivateDirectory(directory: string): Promise<void> {
+  await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  const metadata = await lstat(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("AG Pay outcome routing path must be a private directory");
+  }
+  await chmod(directory, PRIVATE_DIRECTORY_MODE);
+}
+
+async function unlinkIfPresent(path: string): Promise<void> {
+  await unlink(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
+
 function validateState(value: unknown, scope: StoredOutcomeScope): OutcomeRegistryState | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("AG Pay outcome registry is invalid");
@@ -145,8 +221,69 @@ function publicRoutes(
   );
 }
 
+/**
+ * Writes one immutable routing message for the long-running outcome monitor.
+ * The tool runtime can execute in a separate process, so it must never mutate
+ * the monitor's cursor registry directly.
+ */
+export async function enqueueOutcomeRoute(
+  stateDir: string,
+  scope: OutcomeRegistryScope,
+  requestId: string,
+  sessionKey: string,
+  trackedAt = Date.now(),
+): Promise<void> {
+  if (!isAbsolute(stateDir)) {
+    throw new Error("OpenClaw state directory must be absolute");
+  }
+  const normalizedScope = normalizeScope(scope);
+  validateRouteValues(requestId, sessionKey, trackedAt);
+  const directory = join(stateDir, "agpay");
+  const inboxDirectory = join(directory, INBOX_DIRECTORY_NAME);
+  await ensurePrivateDirectory(directory);
+  await ensurePrivateDirectory(inboxDirectory);
+  const inboxEntries = await readdir(inboxDirectory, { withFileTypes: true });
+  if (
+    inboxEntries.filter((entry) => INBOX_FILE_PATTERN.test(entry.name)).length >=
+    MAX_TRACKED_REQUESTS
+  ) {
+    throw new Error("AG Pay outcome routing inbox is full");
+  }
+
+  const route: StoredInboxRoute = {
+    scope: normalizedScope,
+    request_id: requestId.toLowerCase(),
+    session_key: sessionKey,
+    tracked_at: trackedAt,
+  };
+  const serialized = `${JSON.stringify(route)}\n`;
+  if (Buffer.byteLength(serialized) > MAX_INBOX_ROUTE_BYTES) {
+    throw new Error("AG Pay outcome routing message exceeds the allowed size");
+  }
+  const messageId = randomUUID();
+  const filePath = join(
+    inboxDirectory,
+    `checkout-route-${requestId.toLowerCase()}-${messageId}.json`,
+  );
+  const temporaryPath = join(inboxDirectory, `.checkout-route-${messageId}.tmp`);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", PRIVATE_FILE_MODE);
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, filePath);
+    await chmod(filePath, PRIVATE_FILE_MODE);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlinkIfPresent(temporaryPath);
+  }
+}
+
 export class OutcomeRegistry {
   readonly #directory: string;
+  readonly #inboxDirectory: string;
   readonly #filePath: string;
   readonly #scope: StoredOutcomeScope;
   #state: OutcomeRegistryState | undefined;
@@ -154,6 +291,7 @@ export class OutcomeRegistry {
 
   constructor(stateDir: string, scope: OutcomeRegistryScope) {
     this.#directory = join(stateDir, "agpay");
+    this.#inboxDirectory = join(this.#directory, INBOX_DIRECTORY_NAME);
     this.#filePath = join(this.#directory, "checkout-outcomes.json");
     this.#scope = normalizeScope(scope);
   }
@@ -171,32 +309,23 @@ export class OutcomeRegistry {
   async snapshot(): Promise<OutcomeRegistrySnapshot> {
     return this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       return { cursor: state.cursor, requests: publicRoutes(state.requests) };
     });
   }
 
   async track(requestId: string, sessionKey: string, trackedAt = Date.now()): Promise<void> {
-    if (!UUID_PATTERN.test(requestId)) {
-      throw new Error("AG Pay purchase request ID is invalid");
-    }
-    if (sessionKey.length < 1 || sessionKey.length > MAX_SESSION_KEY_LENGTH) {
-      throw new Error("OpenClaw session key is invalid");
-    }
-    if (!Number.isSafeInteger(trackedAt) || trackedAt < 0) {
-      throw new Error("AG Pay outcome tracking timestamp is invalid");
-    }
+    validateRouteValues(requestId, sessionKey, trackedAt);
     await this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       const previousRequests = { ...state.requests };
-      if (!(requestId in state.requests) && Object.keys(state.requests).length >= MAX_TRACKED_REQUESTS) {
-        const oldest = Object.entries(state.requests).sort(
-          ([, left], [, right]) => left.tracked_at - right.tracked_at,
-        )[0];
-        if (oldest) {
-          delete state.requests[oldest[0]];
-        }
-      }
-      state.requests[requestId] = { session_key: sessionKey, tracked_at: trackedAt };
+      this.#storeRoute(
+        state,
+        requestId.toLowerCase(),
+        { session_key: sessionKey, tracked_at: trackedAt },
+        true,
+      );
       try {
         await this.#persist(state);
       } catch (error) {
@@ -212,6 +341,7 @@ export class OutcomeRegistry {
     }
     await this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       const previousCursor = state.cursor;
       const previousRoute = removeRequestId ? state.requests[removeRequestId] : undefined;
       state.cursor = Math.max(state.cursor, cursor);
@@ -236,6 +366,7 @@ export class OutcomeRegistry {
   async forgetRequest(requestId: string): Promise<void> {
     await this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       const previous = state.requests[requestId];
       if (!previous) {
         return;
@@ -256,6 +387,7 @@ export class OutcomeRegistry {
     }
     return this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       const removed = Object.entries(state.requests).filter(([, route]) => route.tracked_at < cutoff);
       if (removed.length === 0) {
         return 0;
@@ -278,6 +410,7 @@ export class OutcomeRegistry {
   async forgetSession(sessionKey: string): Promise<void> {
     await this.#serialize(async () => {
       const state = await this.#ensureInitialized();
+      await this.#drainInbox(state);
       const removed = Object.entries(state.requests).filter(
         ([, route]) => route.session_key === sessionKey,
       );
@@ -298,16 +431,111 @@ export class OutcomeRegistry {
     });
   }
 
+  async #drainInbox(state: OutcomeRegistryState): Promise<void> {
+    await ensurePrivateDirectory(this.#inboxDirectory);
+    const entries = (await readdir(this.#inboxDirectory, { withFileTypes: true }))
+      .filter((entry) => INBOX_FILE_PATTERN.test(entry.name))
+      .slice(0, MAX_TRACKED_REQUESTS);
+    if (entries.length === 0) {
+      return;
+    }
+
+    const previousRequests = { ...state.requests };
+    const consumedPaths: string[] = [];
+    let changed = false;
+    for (const entry of entries) {
+      const filePath = join(this.#inboxDirectory, entry.name);
+      let metadata: Awaited<ReturnType<typeof lstat>>;
+      try {
+        metadata = await lstat(filePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
+      if (
+        !metadata.isFile() ||
+        metadata.isSymbolicLink() ||
+        metadata.size < 1 ||
+        metadata.size > MAX_INBOX_ROUTE_BYTES
+      ) {
+        if (metadata.isFile() || metadata.isSymbolicLink()) {
+          await unlinkIfPresent(filePath);
+        }
+        continue;
+      }
+
+      let route: StoredInboxRoute | null = null;
+      try {
+        route = storedInboxRoute(
+          JSON.parse(await readFile(filePath, "utf8")) as unknown,
+          this.#scope,
+        );
+      } catch {
+        route = null;
+      }
+      const filenameRequestId = INBOX_FILE_PATTERN.exec(entry.name)?.[1]?.toLowerCase();
+      if (!route || route.request_id !== filenameRequestId) {
+        await unlinkIfPresent(filePath);
+        continue;
+      }
+      consumedPaths.push(filePath);
+      changed = this.#storeRoute(state, route.request_id, route) || changed;
+    }
+
+    if (changed) {
+      try {
+        await this.#persist(state);
+      } catch (error) {
+        state.requests = previousRequests;
+        throw error;
+      }
+    }
+    await Promise.all(consumedPaths.map(async (path) => unlinkIfPresent(path)));
+  }
+
+  #storeRoute(
+    state: OutcomeRegistryState,
+    requestId: string,
+    route: StoredOutcomeRoute,
+    replaceExisting = false,
+  ): boolean {
+    const existing = state.requests[requestId];
+    if (
+      existing &&
+      !replaceExisting &&
+      existing.tracked_at >= route.tracked_at
+    ) {
+      return false;
+    }
+    if (
+      existing &&
+      existing.tracked_at === route.tracked_at &&
+      existing.session_key === route.session_key
+    ) {
+      return false;
+    }
+    if (!existing && Object.keys(state.requests).length >= MAX_TRACKED_REQUESTS) {
+      const oldest = Object.entries(state.requests).sort(
+        ([, left], [, right]) => left.tracked_at - right.tracked_at,
+      )[0];
+      if (oldest) {
+        delete state.requests[oldest[0]];
+      }
+    }
+    state.requests[requestId] = {
+      session_key: route.session_key,
+      tracked_at: route.tracked_at,
+    };
+    return true;
+  }
+
   async #ensureInitialized(): Promise<OutcomeRegistryState> {
     if (this.#state) {
       return this.#state;
     }
-    await mkdir(this.#directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    const directoryMetadata = await lstat(this.#directory);
-    if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
-      throw new Error("AG Pay outcome registry directory must be a private directory");
-    }
-    await chmod(this.#directory, PRIVATE_DIRECTORY_MODE);
+    await ensurePrivateDirectory(this.#directory);
     try {
       const metadata = await lstat(this.#filePath);
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
@@ -350,11 +578,7 @@ export class OutcomeRegistry {
       await chmod(this.#filePath, PRIVATE_FILE_MODE);
     } finally {
       await handle?.close().catch(() => undefined);
-      await unlink(temporaryPath).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") {
-          throw error;
-        }
-      });
+      await unlinkIfPresent(temporaryPath);
     }
   }
 

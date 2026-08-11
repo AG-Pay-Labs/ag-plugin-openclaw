@@ -1,4 +1,5 @@
 import { AgPayApiError, type AgPayClient } from "./client.js";
+import type { OutcomeDeliveryTarget } from "./config.js";
 import {
   OutcomeMonitor,
   type OutcomeMonitorLogger,
@@ -26,6 +27,7 @@ interface CheckoutOutcomeServiceOptions {
   pollIntervalSeconds: number;
   logger: OutcomeMonitorLogger;
   notifications: OutcomeNotificationRuntime;
+  outcomeDeliveryTarget?: OutcomeDeliveryTarget;
 }
 
 /**
@@ -40,6 +42,7 @@ export class CheckoutOutcomeService {
   readonly #pollIntervalSeconds: number;
   readonly #logger: OutcomeMonitorLogger;
   readonly #notifications: OutcomeNotificationRuntime;
+  readonly #outcomeDeliveryTarget: OutcomeDeliveryTarget;
   #bootstrapAbort: AbortController | undefined;
   #bootstrapTask: Promise<void> | undefined;
   #registry: OutcomeRegistry | undefined;
@@ -56,6 +59,7 @@ export class CheckoutOutcomeService {
     this.#pollIntervalSeconds = options.pollIntervalSeconds;
     this.#logger = options.logger;
     this.#notifications = options.notifications;
+    this.#outcomeDeliveryTarget = options.outcomeDeliveryTarget ?? "last";
   }
 
   get isReady(): boolean {
@@ -143,6 +147,7 @@ export class CheckoutOutcomeService {
           pollIntervalSeconds: this.#pollIntervalSeconds,
           logger: this.#logger,
           notifications: this.#notifications,
+          outcomeDeliveryTarget: this.#outcomeDeliveryTarget,
         });
         this.#registry = registry;
         this.#monitor = monitor;

@@ -3,13 +3,18 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  enqueueSystemEvent,
+  peekSystemEventEntries,
+  resetSystemEventsForTest,
+} from "openclaw/plugin-sdk/system-event-runtime";
 
 import { AgPayClient } from "../src/client.js";
 import {
   OutcomeMonitor,
   type OutcomeNotificationRuntime,
 } from "../src/outcome-monitor.js";
-import { OutcomeRegistry } from "../src/outcome-registry.js";
+import { enqueueOutcomeRoute, OutcomeRegistry } from "../src/outcome-registry.js";
 
 import {
   AGENT_ID,
@@ -62,6 +67,7 @@ function notificationSpies() {
 }
 
 afterEach(async () => {
+  resetSystemEventsForTest();
   await Promise.all(
     temporaryRoots.splice(0).map(async (path) => rm(path, { recursive: true, force: true })),
   );
@@ -93,15 +99,17 @@ describe("OutcomeMonitor", () => {
     expect(injection?.sessionKey).toBe(SESSION_KEY);
     expect(injection?.idempotencyKey).toBe(`agpay-checkout-event-${EVENT_ID}`);
     expect(injection?.metadata).toMatchObject({ request_id: REQUEST_ID, status: "succeeded" });
+    expect(injection?.text).toMatch(/report this checkout outcome to the user now/i);
     expect(notifications.enqueueSystemEvent).toHaveBeenCalledWith(
       expect.stringContaining(REQUEST_ID),
       { sessionKey: SESSION_KEY, contextKey: `agpay-checkout-event-${EVENT_ID}` },
     );
     expect(notifications.requestHeartbeat).toHaveBeenCalledWith({
-      source: "other",
-      intent: "event",
+      source: "hook",
+      intent: "immediate",
       reason: "agpay-purchase-outcome",
       sessionKey: SESSION_KEY,
+      heartbeat: { target: "last" },
     });
     await expect(state.snapshot()).resolves.toEqual({ cursor: 1, requests: {} });
   });
@@ -175,6 +183,71 @@ describe("OutcomeMonitor", () => {
     await expect(state.snapshot()).resolves.toEqual({ cursor: 10, requests: {} });
   });
 
+  it("discovers a tool-process route without restart after its terminal event raced ahead", async () => {
+    const state = await registry();
+    await state.initialize();
+    let eventFeedCalls = 0;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("/checkout-events?")) {
+        eventFeedCalls += 1;
+        return Promise.resolve(
+          jsonResponse(
+            eventFeedCalls === 1
+              ? {
+                  events: [
+                    checkoutEvent({
+                      status: "failed",
+                      purchase_id: null,
+                      error_code: "payment_declined",
+                    }),
+                  ],
+                  next_cursor: 1,
+                }
+              : { events: [], next_cursor: 1 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        jsonResponse(
+          cartItem({
+            status: "approved",
+            approved_at: "2026-08-05T10:15:00.000Z",
+            checkout_adapter: "demo",
+            checkout_url: "https://merchant.example/checkout/123",
+            execution: checkoutExecution({
+              status: "failed",
+              attempt_count: 1,
+              error_code: "payment_declined",
+              submitted_at: "2026-08-05T10:16:00.000Z",
+              completed_at: "2026-08-05T10:17:00.000Z",
+              updated_at: "2026-08-05T10:17:00.000Z",
+            }),
+          }),
+        ),
+      );
+    });
+    const notifications = notificationSpies();
+    const monitor = new OutcomeMonitor({
+      client: client(fetchMock),
+      registry: state,
+      pollIntervalSeconds: 15,
+      logger: { warn: vi.fn() },
+      notifications: notifications.runtime,
+    });
+
+    await monitor.pollOnce();
+    await expect(state.snapshot()).resolves.toEqual({ cursor: 1, requests: {} });
+
+    const stateDir = dirname(dirname(state.stateFilePath));
+    await enqueueOutcomeRoute(stateDir, SCOPE, REQUEST_ID, SESSION_KEY, TRACKED_AT);
+    await monitor.pollOnce();
+
+    expect(notifications.enqueueNextTurnInjection).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionKey: SESSION_KEY }),
+    );
+    await expect(state.snapshot()).resolves.toEqual({ cursor: 1, requests: {} });
+  });
+
   it("retries with a stable idempotency key until injection or the system fallback is accepted", async () => {
     const state = await registry();
     await state.track(REQUEST_ID, SESSION_KEY, TRACKED_AT);
@@ -238,6 +311,72 @@ describe("OutcomeMonitor", () => {
     );
     expect(notifications.requestHeartbeat).toHaveBeenCalledOnce();
     await expect(state.snapshot()).resolves.toEqual({ cursor: 1, requests: {} });
+  });
+
+  it("queues the fallback in the pinned OpenClaw session and requests a hook wake", async () => {
+    const state = await registry();
+    await state.track(REQUEST_ID, SESSION_KEY, TRACKED_AT);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ events: [checkoutEvent()], next_cursor: 1 }));
+    const requestHeartbeat = vi.fn<OutcomeNotificationRuntime["requestHeartbeat"]>();
+    const monitor = new OutcomeMonitor({
+      client: client(fetchMock),
+      registry: state,
+      pollIntervalSeconds: 15,
+      logger: { warn: vi.fn() },
+      notifications: {
+        enqueueNextTurnInjection: (input) =>
+          Promise.resolve({ enqueued: false, id: "", sessionKey: input.sessionKey }),
+        enqueueSystemEvent,
+        requestHeartbeat,
+      },
+    });
+
+    await monitor.pollOnce();
+
+    const fallbackEvents = peekSystemEventEntries(SESSION_KEY);
+    expect(fallbackEvents).toHaveLength(1);
+    expect(fallbackEvents[0]?.contextKey).toBe(`agpay-checkout-event-${EVENT_ID}`);
+    expect(fallbackEvents[0]?.text).toMatch(/agpay_get_purchase_request/);
+    expect(peekSystemEventEntries(SECOND_SESSION_KEY)).toEqual([]);
+    expect(requestHeartbeat).toHaveBeenCalledWith({
+      source: "hook",
+      intent: "immediate",
+      reason: "agpay-purchase-outcome",
+      sessionKey: SESSION_KEY,
+      heartbeat: { target: "last" },
+    });
+    await expect(state.snapshot()).resolves.toEqual({ cursor: 1, requests: {} });
+  });
+
+  it("can consume an outcome in its originating session without external delivery", async () => {
+    const state = await registry();
+    await state.track(REQUEST_ID, SESSION_KEY, TRACKED_AT);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ events: [checkoutEvent()], next_cursor: 1 }));
+    const notifications = notificationSpies();
+    const monitor = new OutcomeMonitor({
+      client: client(fetchMock),
+      registry: state,
+      pollIntervalSeconds: 15,
+      logger: { warn: vi.fn() },
+      notifications: notifications.runtime,
+      outcomeDeliveryTarget: "none",
+    });
+
+    await monitor.pollOnce();
+
+    expect(notifications.enqueueNextTurnInjection).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionKey: SESSION_KEY }),
+    );
+    expect(notifications.requestHeartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: SESSION_KEY,
+        heartbeat: { target: "none" },
+      }),
+    );
   });
 
   it("accepts a durable injection even when the system-event fallback is unavailable", async () => {
