@@ -3,7 +3,15 @@ const DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_OUTCOME_POLL_INTERVAL_SECONDS = 15;
 const DEFAULT_OUTCOME_DELIVERY_TARGET = "last";
-const CHECKOUT_ADAPTER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const CONFIG_KEYS = new Set([
+  "apiUrl",
+  "agentToken",
+  "heartbeatIntervalSeconds",
+  "requestTimeoutMs",
+  "outcomePollIntervalSeconds",
+  "outcomeDeliveryTarget",
+  "allowSandboxCompletion",
+]);
 
 export type OutcomeDeliveryTarget = "last" | "none";
 
@@ -50,28 +58,10 @@ export const pluginConfigJsonSchema = {
       description:
         "Deliver a sanitized checkout outcome to the originating session's last external channel, or consume it internally without external delivery.",
     },
-    defaultCheckoutAdapter: {
-      type: "string",
-      pattern: "^[a-z0-9][a-z0-9_-]{0,63}$",
-      description:
-        "Optional platform adapter injected when a one-time purchase request omits managed-checkout fields. Configure it with defaultCheckoutUrl.",
-    },
-    defaultCheckoutUrl: {
-      type: "string",
-      format: "uri",
-      pattern: "^https://[^/?#@\\s]+(?:/[^?#\\s]*)?$",
-      maxLength: 2_048,
-      description:
-        "Optional HTTPS checkout entry URL injected with defaultCheckoutAdapter. It must not contain credentials, a query string, or a fragment.",
-    },
     allowSandboxCompletion: {
       type: "boolean",
       default: false,
     },
-  },
-  dependentRequired: {
-    defaultCheckoutAdapter: ["defaultCheckoutUrl"],
-    defaultCheckoutUrl: ["defaultCheckoutAdapter"],
   },
 };
 
@@ -82,8 +72,6 @@ export interface AgPayPluginConfig {
   requestTimeoutMs: number;
   outcomePollIntervalSeconds: number;
   outcomeDeliveryTarget: OutcomeDeliveryTarget;
-  defaultCheckoutAdapter?: string;
-  defaultCheckoutUrl?: string;
   allowSandboxCompletion: boolean;
 }
 
@@ -142,48 +130,13 @@ export function normalizeApiUrl(value: unknown): string {
   return url.toString().replace(/\/$/, "");
 }
 
-function normalizeDefaultCheckoutAdapter(value: unknown): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "string" || !CHECKOUT_ADAPTER_PATTERN.test(value)) {
-    throw new Error(
-      "defaultCheckoutAdapter must start with a lowercase letter or number and contain only lowercase letters, numbers, underscores, or hyphens",
-    );
-  }
-  return value;
-}
-
-function normalizeDefaultCheckoutUrl(value: unknown): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "string" || value.length > 2_048) {
-    throw new Error("defaultCheckoutUrl must be an HTTPS URL of at most 2048 characters");
-  }
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("defaultCheckoutUrl must be a valid HTTPS URL");
-  }
-  if (url.protocol !== "https:") {
-    throw new Error("defaultCheckoutUrl must use HTTPS");
-  }
-  if (url.username || url.password) {
-    throw new Error("defaultCheckoutUrl must not contain credentials");
-  }
-  if (url.search || url.hash) {
-    throw new Error("defaultCheckoutUrl must not contain a query string or fragment");
-  }
-  return url.toString();
-}
-
 export function parsePluginConfig(value: unknown): AgPayPluginConfig {
   const raw = objectValue(value);
+  const unsupportedKey = Object.keys(raw).find((key) => !CONFIG_KEYS.has(key));
+  if (unsupportedKey !== undefined) {
+    throw new Error(`Unsupported AG Pay plugin configuration field: ${unsupportedKey}`);
+  }
   const token = raw.agentToken;
-  const defaultCheckoutAdapter = normalizeDefaultCheckoutAdapter(raw.defaultCheckoutAdapter);
-  const defaultCheckoutUrl = normalizeDefaultCheckoutUrl(raw.defaultCheckoutUrl);
   if (
     token !== undefined &&
     (typeof token !== "string" ||
@@ -205,12 +158,6 @@ export function parsePluginConfig(value: unknown): AgPayPluginConfig {
   ) {
     throw new Error("outcomeDeliveryTarget must be last or none");
   }
-  if ((defaultCheckoutAdapter === undefined) !== (defaultCheckoutUrl === undefined)) {
-    throw new Error(
-      "defaultCheckoutAdapter and defaultCheckoutUrl must be configured together",
-    );
-  }
-
   return {
     apiUrl: normalizeApiUrl(raw.apiUrl),
     ...(token === undefined ? {} : { agentToken: token }),
@@ -236,9 +183,6 @@ export function parsePluginConfig(value: unknown): AgPayPluginConfig {
       "outcomePollIntervalSeconds",
     ),
     outcomeDeliveryTarget: raw.outcomeDeliveryTarget ?? DEFAULT_OUTCOME_DELIVERY_TARGET,
-    ...(defaultCheckoutAdapter === undefined || defaultCheckoutUrl === undefined
-      ? {}
-      : { defaultCheckoutAdapter, defaultCheckoutUrl }),
     allowSandboxCompletion: raw.allowSandboxCompletion ?? false,
   };
 }

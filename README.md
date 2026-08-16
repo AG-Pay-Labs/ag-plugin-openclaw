@@ -15,7 +15,8 @@ available only for adapters explicitly configured there.
 
 ## What the plugin adds
 
-- `agpay_request_purchase`: create a purchase request for the paired agent;
+- `agpay_request_purchase`: create a managed-checkout purchase request for the
+  paired agent;
 - `agpay_get_purchase_request`: read approval and sanitized checkout state;
 - `agpay_record_purchase_result`: legacy test-only recording for a request with
   no platform-managed checkout, disabled by default;
@@ -41,12 +42,12 @@ tool contracts.
 
 After approval, the AG Pay platform may queue a checkout through a supported
 configured adapter. Managed checkout currently supports one-time purchases
-only; recurring requests with a non-null `billing_period` remain approval-only
-and cannot include managed-checkout parameters. Browser automation, Browserbase
-credentials and session IDs, merchant-account credentials, payment credentials,
-and provider secrets remain inside that trusted platform path. They are never
-sent to OpenClaw, its model, this plugin's state file, or plugin logs. The plugin
-stores only a nonsecret API/agent scope, an event cursor, and bounded
+only; the OpenClaw purchase-request tool rejects a non-null `billing_period`.
+Browser automation, Browserbase credentials and session IDs, merchant-account
+credentials, payment credentials, and provider secrets remain inside that
+trusted platform path. They are never sent to OpenClaw, its model, this plugin's
+state file, or plugin logs. The plugin stores only a nonsecret API/agent scope,
+an event cursor, and bounded
 purchase-request-to-session routing metadata so it can route sanitized
 outcomes. Because an OpenClaw tool and service may execute in separate
 processes, the tool publishes each route as an atomic private state message;
@@ -78,14 +79,26 @@ it is not purchase confirmation. Only a `succeeded` execution event confirms a
 recorded purchase. `outcome_unknown` must be reconciled in AG Pay and must never
 be retried automatically.
 
-Operators may configure `defaultCheckoutAdapter` and `defaultCheckoutUrl` as a
-pair. For a one-time request that omits both model-facing checkout fields, the
-plugin injects that non-secret pair directly into the AG Pay API request. This
-lets OpenClaw submit a product URL and verified product facts without having to
-know the platform's checkout bootstrap URL. An explicit `checkout_adapter` plus
-`checkout_url` pair remains authoritative; a partial explicit pair is rejected
-rather than combined with a default. When the default pair is absent, omitted
-checkout fields preserve the legacy approval-only behavior.
+The model-facing purchase-request tool requires `checkout_adapter` and
+`checkout_url` on every call. It has no configured checkout URL, fixed fallback,
+or approval-only mode. Before calling the tool, the OpenClaw agent must navigate
+from the exact selected offer into checkout and capture that offer's complete
+checkout URL. Missing or partial checkout fields are rejected before AG Pay is
+contacted. Other API clients may use platform flows that are outside this
+plugin's narrower contract.
+
+The `stripe-hosted` adapter accepts only a complete Stripe test Checkout Session
+URL shaped like `https://checkout.stripe.com/c/pay/cs_test_...`. The exact URL,
+including any Stripe-generated fragment, is forwarded unchanged. The generic
+`https://checkout.stripe.com/` root, live-mode sessions, Payment Links, other
+hosts, and malformed session paths are rejected before the plugin contacts AG
+Pay. The plugin forwards the offer-specific URL supplied by OpenClaw; it does
+not open the protected checkout browser or handle payment fields.
+
+After navigating into checkout, OpenClaw must copy the visible product-summary
+title verbatim into `title`. It must not add merchant, storefront, page, or
+playground branding; the worker intentionally rejects a decorated or otherwise
+different title before loading payment credentials.
 
 ## Requirements
 
@@ -165,8 +178,6 @@ Configure the file as an OpenClaw SecretRef provider:
           requestTimeoutMs: 10000,
           outcomePollIntervalSeconds: 15,
           outcomeDeliveryTarget: "last",
-          defaultCheckoutAdapter: "stripe-hosted",
-          defaultCheckoutUrl: "https://checkout.stripe.com/",
           allowSandboxCompletion: false,
         },
       },
@@ -193,11 +204,11 @@ not a scope encoded in or enforced by the `agt_...` bearer token.
 Pairings created before checkout outcome support should be renewed so the
 runtime advertises the `checkout-events.v1` capability.
 
-The example default pair is suitable only when the platform operator has
-enabled a matching `stripe-hosted` adapter. Both values are optional, but they
-must be configured together, and the URL must use HTTPS without embedded
-credentials, a query string, or a fragment. Removing both values restores
-approval-only behavior for requests that omit checkout fields.
+At tool-call time, OpenClaw must supply the adapter and exact offer-specific URL
+together. For `stripe-hosted`, that is the complete test Checkout Session URL,
+including its Stripe-generated fragment. The plugin rejects a generic Stripe
+checkout root, Payment Link, live-mode Session, malformed Session path, or URL
+for which the adapter is missing.
 
 SecretRefs and `0600` files reduce accidental disclosure and access by other OS
 users. They do not protect a bearer token from an agent with unrestricted shell

@@ -10,6 +10,7 @@ interface PluginManifest {
   name: string;
   description: string;
   version: string;
+  uiHints: Record<string, unknown>;
   configSchema: Record<string, unknown>;
 }
 
@@ -60,31 +61,32 @@ describe("OpenClaw package metadata", () => {
     expect(result.success).toBe(true);
   });
 
-  it("requires the managed-checkout default fields as a schema-level pair", () => {
+  it("rejects removed managed-checkout defaults at schema level", () => {
     const safeParse = plugin.configSchema?.safeParse;
     if (!safeParse) {
       throw new Error("AG Pay plugin config schema is unavailable");
     }
+    const manifest = readJson<PluginManifest>("../openclaw.plugin.json");
 
     expect(
       safeParse({
         defaultCheckoutAdapter: "stripe-hosted",
-        defaultCheckoutUrl: "https://checkout.stripe.com/",
+        defaultCheckoutUrl:
+          "https://checkout.stripe.com/c/pay/cs_test_Manifest123#stripe-generated-fragment",
       }).success,
-    ).toBe(true);
+    ).toBe(false);
     expect(safeParse({ defaultCheckoutAdapter: "stripe-hosted" }).success).toBe(false);
-    expect(safeParse({ defaultCheckoutUrl: "https://checkout.stripe.com/" }).success).toBe(false);
     expect(
       safeParse({
-        defaultCheckoutAdapter: "stripe-hosted",
-        defaultCheckoutUrl: "https://user:password@checkout.stripe.com/",
+        defaultCheckoutUrl:
+          "https://checkout.stripe.com/c/pay/cs_test_Manifest123#stripe-generated-fragment",
       }).success,
     ).toBe(false);
-    expect(
-      safeParse({
-        defaultCheckoutAdapter: "stripe-hosted",
-        defaultCheckoutUrl: "https://checkout.stripe.com/?session=secret",
-      }).success,
-    ).toBe(false);
+    expect(manifest.uiHints).not.toHaveProperty("defaultCheckoutAdapter");
+    expect(manifest.uiHints).not.toHaveProperty("defaultCheckoutUrl");
+    expect(manifest.configSchema).not.toHaveProperty(
+      "properties.defaultCheckoutAdapter",
+    );
+    expect(manifest.configSchema).not.toHaveProperty("properties.defaultCheckoutUrl");
   });
 });
